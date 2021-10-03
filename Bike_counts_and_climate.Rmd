@@ -63,24 +63,50 @@ data. Temperature data with a value of `+9999` is missing, and there is
 a variable with a flag for temperature measurement quality. From the ISD
 documentation:
 
-| Value | Meaning                                                                                                                                                                                  |
-|-------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| 0     | Passed gross limits check                                                                                                                                                                |
-| 1     | Passed all quality control checks                                                                                                                                                        |
-| 2     | Suspect                                                                                                                                                                                  |
-| 3     | Erroneous                                                                                                                                                                                |
-| 4     | Passed gross limits check, data originate from an NCEI data source                                                                                                                       |
-| 5     | Passed all quality control checks, data originate from an NCEI data source                                                                                                               |
-| 6     | Suspect, data originate from an NCEI data source                                                                                                                                         |
-| 7     | Erroneous, data originate from an NCEI data source                                                                                                                                       |
-| 9     | Passed gross limits check if element is present                                                                                                                                          |
-| A     | Data value flagged as suspect, but accepted as a good value                                                                                                                              |
-| C     | Temperature and dew point received from Automated Weather Observing System (AWOS) are reported in whole degrees Celsius. Automated QC flags these values, but they are accepted as value |
-| I     | Data value not originally in data, but inserted by validator                                                                                                                             |
-| M     | Manual changes made to value based on information provided by NWS or FAA                                                                                                                 |
-| P     | Data value not originally flagged as suspect, but replaced by validator                                                                                                                  |
-| R     | Data value replaced with value computed by NCEI software                                                                                                                                 |
-| U     | Data value replaced with edited value                                                                                                                                                    |
++---+--------------------------------------------------------------------+
+| V | Meaning                                                            |
+| a |                                                                    |
+| l |                                                                    |
+| u |                                                                    |
+| e |                                                                    |
++===+====================================================================+
+| 0 | Passed gross limits check                                          |
++---+--------------------------------------------------------------------+
+| 1 | Passed all quality control checks                                  |
++---+--------------------------------------------------------------------+
+| 2 | Suspect                                                            |
++---+--------------------------------------------------------------------+
+| 3 | Erroneous                                                          |
++---+--------------------------------------------------------------------+
+| 4 | Passed gross limits check, data originate from an NCEI data source |
++---+--------------------------------------------------------------------+
+| 5 | Passed all quality control checks, data originate from an NCEI     |
+|   | data source                                                        |
++---+--------------------------------------------------------------------+
+| 6 | Suspect, data originate from an NCEI data source                   |
++---+--------------------------------------------------------------------+
+| 7 | Erroneous, data originate from an NCEI data source                 |
++---+--------------------------------------------------------------------+
+| 9 | Passed gross limits check if element is present                    |
++---+--------------------------------------------------------------------+
+| A | Data value flagged as suspect, but accepted as a good value        |
++---+--------------------------------------------------------------------+
+| C | Temperature and dew point received from Automated Weather          |
+|   | Observing System (AWOS) are reported in whole degrees Celsius.     |
+|   | Automated QC flags these values, but they are accepted as value    |
++---+--------------------------------------------------------------------+
+| I | Data value not originally in data, but inserted by validator       |
++---+--------------------------------------------------------------------+
+| M | Manual changes made to value based on information provided by NWS  |
+|   | or FAA                                                             |
++---+--------------------------------------------------------------------+
+| P | Data value not originally flagged as suspect, but replaced by      |
+|   | validator                                                          |
++---+--------------------------------------------------------------------+
+| R | Data value replaced with value computed by NCEI software           |
++---+--------------------------------------------------------------------+
+| U | Data value replaced with edited value                              |
++---+--------------------------------------------------------------------+
 
 That's a lot of flags! Let's see how they're distributed for this
 particular dataset:
@@ -118,18 +144,16 @@ climate <- climate %>%
     TRUE ~ NA_character_))
 ```
 
-To become familiar with the data structure, we'll extract hourly
-temperature data and perform basic cleaning steps:
+Next we create a set of hourly temperatures.
 
 ```{r}
-# filter rows with missing air temperature and duplicate temp entries
+# filter rows with duplicate temp entries
 # (the latter is I believe from 24 h rows)
 # create new date/time variable
 # fix temperature units to degree Celsius
-# for hours with more than 1 measurement, average between value
+# for hours with more than 1 measurement, average between values
 
 hourly_temp <- climate %>% 
-  filter(temperature != "+9999", call_letter != "99999") %>% 
   mutate(date_time = paste(date, time, sep = " ")) %>% 
   mutate(date_time = round_date(ymd_hm(date_time, tz = "UTC"), "hour")) %>%
   mutate(temperature = as.double(temperature) / 10) %>%
@@ -137,21 +161,27 @@ hourly_temp <- climate %>%
   mutate(temperature = mean(temperature)) %>% 
   distinct(date_time, .keep_all = T)
 
-hourly_temp %>% 
-  filter(date_time < "2016-01-01") %>% 
-  ggplot(aes(date, temperature)) +
-  geom_col(alpha = .3)
-
-
-
 ```
+
+A quick plot of one month's worth of data to see if this worked:
+
+```{r}
+hourly_temp %>% 
+  filter(date_time < "2015-01-01 0:00:00" & date_time > "2014-12-01 0:00:00") %>% 
+  ggplot(aes(date_time, temperature)) +
+  geom_line(alpha = .3)
+```
+
+Looks good! You can see a bunch of missing values, and it may be worth
+interpolating them. But we'll leave this as is for now. Next we turn to
+precipitation.
 
 Precipitation data requires separate cleaning, as the data structure is
 more complicated. There are hourly measurements, 6-hourly, and daily
 totals, and apparently those don't always neatly match up. In addition,
 precipitation can be liquid (rain) or not (snow etc.). Since we have
-bike count data in hourly increments, we'll try to also use hourly
-precipitation measurements.
+bike count data in hourly increments, we'll use hourly precipitation
+measurements for now.
 
 ```{r}
 climate %>% 
@@ -161,7 +191,29 @@ climate %>%
   group_by(date) %>% 
   summarize(daily_precip = sum(precip)) %>%  
   ggplot(aes(date, daily_precip)) +
-  geom_jitter()
+  geom_jitter(alpha = .1)
+```
+
+Similar to the temperature data, we should check the quality flags on
+the precipitation measurements:
+
+```{r}
+climate %>% 
+  filter(AA1_period_quantity_hrs == "01") %>% 
+  ggplot(aes(AA1_quality_code)) +
+  geom_bar()
+
+climate %>% 
+  filter(AA1_period_quantity_hrs == "01") %>%
+  count(AA1_quality_code)
+```
+
+This seems to have even less missing/suspect data!
+
+```{r}
+climate <- climate %>% 
+  filter(AA1_period_quantity_hrs == "01") %>% 
+  mutate(AA1_)
 ```
 
 df \<- ncdc(datasetid='GHCND', stationid='GHCND:USW00014837', startdate
