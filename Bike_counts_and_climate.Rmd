@@ -1,0 +1,313 @@
+---
+title: "Untitled"
+description: |
+  A new article created using the Distill format.
+author:
+  - name: Nora Jones 
+    url: https://example.com/norajones
+    affiliation: Spacely Sprockets
+    affiliation_url: https://example.com/spacelysprokets
+date: "`r Sys.Date()`"
+output: distill::distill_article
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+Using data from two bike counters in Madison, I want to explore which
+climatic factor help explain variation in hourly bike counts.
+
+```{r}
+
+library(tidyverse)
+library(purrr)
+library(lubridate)
+library(rnoaa)
+library(timeDate) #needed for dealing with holidays
+
+```
+
+# Acquiring climate data
+
+I will use data from NOAA's Madison airport weather station. While that
+station is a couple miles from the two counters, it has probably the
+most comprehensive data. The data product is the "Integrated Surface
+Data" (ISD). These data are quite complex, with 532 variables. A full
+data dictionary is available
+[here](ftp://ftp.ncdc.noaa.gov/pub/data/noaa/isd-format-document.pdf). A
+higher level introduction to the data is
+[here](https://www.visualcrossing.com/blog/how-we-process-integrated-surface-database-historical-weather-data).
+The `rnoaa` package helps us access the data.
+
+Bike counter data go back to 2014, and so we'll download and combine the
+climate for all years from 2014 to 2021. This produces a dataframe with
+about 100,000 observations! Because ISD records are organized by year,
+we write a short helper function and then `map` across the years. {\^
+Requests will sometimes time out or throw other errors. To resolve this,
+try re-running the function for just that single year, and once that has
+succeeded, the data are cached and you can re-run over all years.]
+
+```{r}
+## define function to get data
+get_isd <- function(year) {isd(usaf = "726410", wban = "14837", year = year)}
+## map function over years
+climate <- map_df(2014:2021,get_isd)
+```
+
+First we'll look at the completeness and quality of the temperature
+data. Temperature data with a value of `+9999` is missing, and there is
+a variable with a flag for temperature measurement quality. From the ISD
+documentation:
+
+| Value | Meaning                                                                                                                                                                                  |
+|-------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 0     | Passed gross limits check                                                                                                                                                                |
+| 1     | Passed all quality control checks                                                                                                                                                        |
+| 2     | Suspect                                                                                                                                                                                  |
+| 3     | Erroneous                                                                                                                                                                                |
+| 4     | Passed gross limits check, data originate from an NCEI data source                                                                                                                       |
+| 5     | Passed all quality control checks, data originate from an NCEI data source                                                                                                               |
+| 6     | Suspect, data originate from an NCEI data source                                                                                                                                         |
+| 7     | Erroneous, data originate from an NCEI data source                                                                                                                                       |
+| 9     | Passed gross limits check if element is present                                                                                                                                          |
+| A     | Data value flagged as suspect, but accepted as a good value                                                                                                                              |
+| C     | Temperature and dew point received from Automated Weather Observing System (AWOS) are reported in whole degrees Celsius. Automated QC flags these values, but they are accepted as value |
+| I     | Data value not originally in data, but inserted by validator                                                                                                                             |
+| M     | Manual changes made to value based on information provided by NWS or FAA                                                                                                                 |
+| P     | Data value not originally flagged as suspect, but replaced by validator                                                                                                                  |
+| R     | Data value replaced with value computed by NCEI software                                                                                                                                 |
+| U     | Data value replaced with edited value                                                                                                                                                    |
+
+That's a lot of flags! Let's see how they're distributed for this
+particular dataset:
+
+```{r}
+climate %>% 
+  ggplot(aes(temperature_quality)) +
+  geom_bar()
+
+climate %>% 
+  count(temperature_quality)
+```
+
+This looks promising: A vast majority of data passed all quality checks;
+there are only a handful of suspect values. The only big a category that
+warrants further investigation is the one flagged `9`, "Passed gross
+limits check if element is present." The definition is rather cryptic,
+and so let's plot these:
+
+```{r}
+climate %>% 
+  filter(temperature_quality == "A") %>% 
+  select(temperature)
+  ggplot(aes(temperature)) +
+  geom_bar()
+```
+
+Okay, so these are missing values. Based on this, we'll keep values
+flagged `1, 5, A` and we'll set to `NA` those with `6, 9, P`
+
+```{r}
+climate <- climate %>% 
+  mutate(temperature = case_when(
+    temperature_quality %in% c("1", "5", "A") ~ temperature,
+    TRUE ~ NA_character_))
+```
+
+To become familiar with the data structure, we'll extract hourly
+temperature data and perform basic cleaning steps:
+
+```{r}
+# filter rows with missing air temperature and duplicate temp entries
+# (the latter is I believe from 24 h rows)
+# create new date/time variable
+# fix temperature units to degree Celsius
+# for hours with more than 1 measurement, average between value
+
+hourly_temp <- climate %>% 
+  filter(temperature != "+9999", call_letter != "99999") %>% 
+  mutate(date_time = paste(date, time, sep = " ")) %>% 
+  mutate(date_time = round_date(ymd_hm(date_time, tz = "UTC"), "hour")) %>%
+  mutate(temperature = as.double(temperature) / 10) %>%
+  group_by(date_time) %>% 
+  mutate(temperature = mean(temperature)) %>% 
+  distinct(date_time, .keep_all = T)
+
+hourly_temp %>% 
+  filter(date_time < "2016-01-01") %>% 
+  ggplot(aes(date, temperature)) +
+  geom_col(alpha = .3)
+
+
+
+```
+
+Precipitation data requires separate cleaning, as the data structure is
+more complicated. There are hourly measurements, 6-hourly, and daily
+totals, and apparently those don't always neatly match up. In addition,
+precipitation can be liquid (rain) or not (snow etc.). Since we have
+bike count data in hourly increments, we'll try to also use hourly
+precipitation measurements.
+
+```{r}
+climate %>% 
+  filter(AA1_period_quantity_hrs == "01") %>% 
+  mutate(precip = as.numeric(AA1_depth)) %>% 
+  mutate(date = ymd(date)) %>% 
+  group_by(date) %>% 
+  summarize(daily_precip = sum(precip)) %>%  
+  ggplot(aes(date, daily_precip)) +
+  geom_jitter()
+```
+
+df \<- ncdc(datasetid='GHCND', stationid='GHCND:USW00014837', startdate
+= "2018-01-01", enddate = "2018-01-06", add_units = TRUE, limit = 1000)
+
+# list of years and data types
+
+combo \<- list(year = c(2014:2019), id = c("PRCP", "SNOW", "SNWD",
+"TMAX", "TMIN", "TOBS")) \#create list of all possible combinations;
+transpose so that map2 can digest it args \<- combo %\>% cross() %\>%
+transpose()
+
+# map over args to get weather data
+
+weather \<- map2_df(args[[1]], args[[2]], get_weather)
+
+\#\#get bike counter data cc_counts \<-
+read_csv("<https://opendata.arcgis.com/datasets/367cb53685c74628b4975d8f65d20748_0.csv>",
+col_types = "ci-") %\>% mutate(location = "Cap City at North Shore")
+sw_counts \<-
+read_csv("<https://opendata.arcgis.com/datasets/8860784eb30e4a45a6f853b5f81949f2_0.csv>",
+col_types = "ci-") %\>% mutate(location = "SW Path at Randall")
+\#combine two counter locations counts \<- bind_rows(cc_counts,
+sw_counts) \#some data prep for counts counts2 \<- counts %\>% drop_na
+%\>% mutate(Count_Date = mdy_hm(Count_Date, tz = "US/Central"), \#fix
+date and time location = as.factor(location), Count = ifelse(Count == 0,
+1, Count), \#convert 0 counts to 1 to allow log transform log_count =
+log(Count), \#create value for log of count dayofweek =
+wday(Count_Date), weekendind = ifelse(dayofweek %in% c(1:5), "weekday",
+"weekend"))
+
+counts2 %\>% filter(Count_Date \>= ymd("2018-06-15") & Count_Date \<=
+ymd("2018-07-05")) %\>% ggplot(aes(Count_Date, Count)) + geom_line()
+
+counts2 %\>% filter(Count_Date \>= ymd("2018-07-02") & Count_Date \<=
+ymd("2018-07-04") & location == "SW Path at Randall") %\>%
+ggplot(aes(Count_Date, Count)) + geom_col()
+
+# check for consecutive identical non-zero values
+
+dupes \<- rle(counts2\$Count) head(dupes)
+
+tibble(length = dupes$lengths, values = dupes$values) %\>%
+\#filter(values != 1 & length \>1) %\>% arrange(desc(length)) %\>%
+group_by(values) %\>% ggplot(aes(length, values)) + geom_point(alpha =
+0.2)
+
+counts2 %\>% filter(Count_Date \>= ymd("2018-07-02") & Count_Date \<=
+ymd("2018-07-04")) %\>% group_by(location) %\>% ggplot(aes(Count_Date,
+Count, fill = location)) + geom_col(position = "dodge")
+
+# IQR moving average
+
+thresholds \<- counts2 %\>% filter(location == "SW Path at Randall" &
+Count_Date \>= ymd("2018-07-02") - days(27) & Count_Date \<=
+ymd("2018-07-02")) %\>% group_by(hour(Count_Date)) %\>%
+summarize(hourly_IQR = IQR(Count), q3 = quantile(Count, 3/4), q1 =
+quantile(Count, 1/4)) %\>% mutate(upper_thresh = q3 + 2\* hourly_IQR,
+\#establishing the upper threshold lower_thresh = q1 - 2\* hourly_IQR)
+\#and the lower threshold (which can be negative)
+
+counts_ts \<- counts2 %\>% select(Count_Date, Count) %\>% as.ts() %\>%
+stl(t.window=13, s.window="periodic", robust=TRUE) %\>% autoplot()
+as.ts(counts2) %\>% stl(t.window=13, s.window="periodic", robust=TRUE)
+%\>% autoplot()
+
+library(imputeTS) counts_ts \<- counts2 %\>% filter(location == "SW Path
+at Randall") %\>% mutate(Count = ifelse(Count \> 500, NA, Count)) %\>%
+select(Count_Date, Count) %\>% as.ts()
+
+high \<- counts2 %\>% filter(location == "SW Path at Randall")
+
+high \<- which(high\$Count \> 500) counts_ts_int \<-
+na.interpolation(counts_ts, option = "linear") counts_ts_int[high,]
+counts_ts_int[high+1,]
+
+counts2 %\>% mutate(same = lead(Count) == Count, same2 = same == TRUE &
+lead(same) == TRUE) %\>% arrange(desc(same2))
+
+counts2 %\>% group_by(location, year(Count_Date)) %\>%
+summarize(avg_daily = mean(Count\*24))
+
+difference \<- which(diff(counts2\$Count) == 0)
+
+df \<- counts2[difference,] %\>% filter(Count != 1) %\>%
+arrange(Count_Date)
+
+counts2 %\>% mutate(runlength = rle(Count))
+
+counts2 %\>% mutate(nextvalue = diff(Count, 1)) %\>% filter(nextvalue ==
+0 & Count \> 0)
+
+counts2 %\>% filter(Count_Date \>= ymd("2019-07-02") & Count_Date \<=
+ymd("2019-07-04")) %\>% ggplot(aes(Count_Date, Count)) + geom_col()
+
+\#join hourly temperature to counts df \<- counts2 %\>%
+left_join(hourly_temp, by = c("Count_Date" = "date_time"))
+
+lin \<- df %\>% filter(location == "Cap City at North Shore") %\>%
+lm(Count \~ temperature + weekendind) summary(lin)
+
+lin \<- lm(Count \~ temperature+hour(Count_Date)+wday(Count_Date), df)
+summary(lin)
+
+qplot(temperature, log_count, data = df) df %\>% group_by(location) %\>%
+ggplot(aes(temperature, log_count)) + geom_point() +
+facet_wrap(\~location)
+
+df %\>% cor(df$temperature, hour(df$Count_Date), use = "complete.obs")
+
+summary(lin) df %\>% filter(hour(Count_Date) %in% c(6:10),
+wday(Count_Date) %in% c(1:5)) %\>% ggplot(aes(temperature, Count)) +
+geom_point(alpha = 0.2) + geom_smooth() + facet_wrap(\~ location)
+
+qplot(y = Count, x = temperature, data = df, geom = "point")
+
+round_date(res\$date_time, "hour")
+
+\#count number by weekday and location counts2 %\>% mutate(day =
+wday(Count_Date, label = TRUE)) %\>% group_by(location, day) %\>%
+summarize(sum = sum(Count)) %\>% ggplot(aes(day, sum, fill = location))
++ geom_col(position = "dodge")
+
+\#count number by hour of day and location counts %\>%
+filter(wday(Count_Date) %in% c(1:5)) %\>% \#filter to weekdays only
+mutate(hour = hour(Count_Date)) %\>% group_by(location, hour) %\>%
+summarize(sum = sum(Count)) %\>% ggplot(aes(hour, sum, fill = location))
++ geom_col(position = "dodge")
+
+counts2 %\>% filter(year(Count_Date) %in% c(2015:2018)) %\>%
+filter(location != "Cap City at North Shore" \| year(Count_Date) !=
+2015) %\>% group_by(location, year(Count_Date)) %\>% summarize(sum =
+sum(Count)) %\>% ggplot(aes(x = `year(Count_Date)`, sum, fill =
+location)) + geom_col(position = "dodge")
+
+counts2 %\>% mutate(hour = hour(Count_Date)) %\>% group_by(location,
+hour, weekendind) %\>% summarize(sum = sum(Count)) %\>% ggplot(aes(hour,
+sum, fill = location)) + geom_col(position = "dodge") + facet_wrap(\~
+weekendind)
+
+\#counts per year counts2 %\>% mutate(year = year(Count_Date)) %\>%
+group_by(location, year) %\>% summarize(sum = sum(Count)) %\>%
+ggplot(aes(year, sum, fill = location)) + geom_col(position = "dodge")
+
+\#count number by year and location \#to do: either filter for only
+complete years or make it a riders/day metric counts %\>% mutate(year =
+year(Count_Date), day = day(Count_Date)) %\>% group_by(location, year,
+day) %\>% summarise(sum = n()) %\>% ggplot(aes(year, sum, fill =
+location)) + geom_col(position = "dodge")
